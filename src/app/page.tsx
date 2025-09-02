@@ -21,7 +21,7 @@ export default function Home() {
       const formData = new FormData();
       formData.append('file', file);
       
-      const response = await axios.post("http://localhost:8080/upload", formData, {
+      const response = await axios.post("http://52.90.61.47:8080/upload", formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
@@ -42,7 +42,7 @@ export default function Home() {
 
   try {
     console.log(port)
-    const response = await axios.get(`http://localhost:8080/download/${port}`, {
+    const response = await axios.get(`http://52.90.61.47:8080/download/${port}`, {
       responseType: "blob"
     });
 
