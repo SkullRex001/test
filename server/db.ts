@@ -2,9 +2,11 @@ import { drizzle } from 'drizzle-orm/neon-http';
 import { neon } from '@neondatabase/serverless';
 import { users, medicalReports } from '@shared/schema';
 
-if (!process.env.DATABASE_URL) {
+let dburl = "postgres://myuser:mypassword@localhost:5432/mydb"
+
+if (!dburl) {
   throw new Error('DATABASE_URL environment variable is required');
 }
 
-const sql = neon(process.env.DATABASE_URL);
+const sql = neon(dburl);
 export const db = drizzle(sql, { schema: { users, medicalReports } });
