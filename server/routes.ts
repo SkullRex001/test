@@ -6,7 +6,8 @@ import { textPreprocessor } from "./services/text-preprocessor";
 import { medicalTestNormalizer } from "./services/normalizer";
 import { openaiService } from "./services/openai";
 import { guardrailService } from "./services/guardrails";
-import { processRequestSchema, ocrResultSchema, normalizedTestsSchema } from "@shared/schema";
+import { fileProcessor } from "./services/file-processor";
+import { processRequestSchema, ocrResultSchema, normalizedTestsSchema, batchProcessRequestSchema } from "@shared/schema";
 import multer from "multer";
 
 // Configure multer for file uploads
@@ -16,11 +17,23 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
-    if (allowedTypes.includes(file.mimetype)) {
+    const allowedTypes = [
+      'image/jpeg', 
+      'image/png', 
+      'image/jpg', 
+      'application/pdf',
+      'application/dicom' // DICOM files
+    ];
+    
+    // For application/octet-stream, check if it's actually a DICOM file
+    if (file.mimetype === 'application/octet-stream') {
+      // We'll validate DICOM signature in the processing step
+      // For now, allow it through and let fileProcessor validate
+      cb(null, true);
+    } else if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Only JPEG, PNG, and PDF files are allowed.'));
+      cb(new Error('Invalid file type. Only JPEG, PNG, PDF, and DICOM files are allowed.'));
     }
   }
 });
@@ -98,27 +111,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // File upload OCR endpoint
+  // File upload OCR endpoint - supports images, PDFs, and DICOM files
   app.post("/api/v1/ocr/extract-file", upload.single('file'), async (req, res) => {
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const base64Data = req.file.buffer.toString('base64');
-      const result = await medicalProcessor.extractText({ 
-        input_type: 'image', 
-        data: base64Data 
-      });
+      console.log(`Processing file: ${req.file.originalname} (${req.file.mimetype})`);
       
-      if (!result) {
-        return res.status(500).json({ error: "Failed to extract text from file" });
-      }
+      // Process different file types using the new file processor
+      const fileResult = await fileProcessor.processFile(
+        req.file.buffer, 
+        req.file.originalname, 
+        req.file.mimetype
+      );
+      
+      // Parse extracted text to get proper tests array
+      const testsRaw = fileResult.text ? 
+        textPreprocessor.extractTestsFromText(fileResult.text) : 
+        [];
+
+      // Convert to standard OCR result format
+      const result = {
+        tests_raw: testsRaw,
+        raw_text: fileResult.text, // Include full text for reference
+        confidence: fileResult.confidence,
+        file_type: fileResult.fileType,
+        metadata: fileResult.metadata
+      };
 
       res.json(result);
     } catch (error) {
-      console.error("File OCR error:", error);
-      res.status(500).json({ error: "Internal server error during file processing" });
+      console.error("File processing error:", error);
+      res.status(500).json({ 
+        error: "Internal server error during file processing",
+        details: error instanceof Error ? error.message : String(error)
+      });
     }
   });
 
@@ -242,7 +271,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Complete processing pipeline with file upload
+  // Complete processing pipeline with file upload - supports images, PDFs, and DICOM files  
   app.post("/api/v1/process/complete-file", upload.single('file'), async (req, res) => {
     const startTime = Date.now();
     
@@ -251,13 +280,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const base64Data = req.file.buffer.toString('base64');
-      const request = { input_type: 'image' as const, data: base64Data };
+      console.log(`Processing file for complete pipeline: ${req.file.originalname} (${req.file.mimetype})`);
+      
+      // Process the file to extract text
+      const fileResult = await fileProcessor.processFile(
+        req.file.buffer, 
+        req.file.originalname, 
+        req.file.mimetype
+      );
+      
+      // Create request for medical processor using extracted text
+      const request = { 
+        input_type: 'text' as const, 
+        data: fileResult.text || `[${fileResult.fileType} file processed with ${fileResult.confidence} confidence]` 
+      };
       
       // Create medical report record
       const report = await storage.createMedicalReport({
-        inputType: 'image',
-        originalInput: base64Data,
+        inputType: fileResult.fileType,
+        originalInput: req.file.buffer.toString('base64'),
         status: "processing",
         ocrResults: null,
         normalizedTests: null,
@@ -338,6 +379,239 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Get report error:", error);
       res.status(500).json({ error: "Failed to fetch report" });
+    }
+  });
+
+  // Batch processing endpoint
+  app.post("/api/v1/process/batch", async (req, res) => {
+    const startTime = Date.now();
+    
+    try {
+      const validation = batchProcessRequestSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ 
+          error: "Invalid batch request format",
+          details: validation.error.errors 
+        });
+      }
+
+      const { reports, batch_id } = validation.data;
+      const batchId = batch_id || `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      console.log(`Processing batch ${batchId} with ${reports.length} reports`);
+
+      const results = [];
+      let successful = 0;
+      let failed = 0;
+
+      // Process each report in the batch
+      for (let i = 0; i < reports.length; i++) {
+        const report = reports[i];
+        console.log(`Processing report ${i + 1}/${reports.length} in batch ${batchId}`);
+        
+        try {
+          // Create individual medical report record
+          const dbReport = await storage.createMedicalReport({
+            inputType: report.input_type,
+            originalInput: report.data,
+            status: "processing",
+            ocrResults: null,
+            normalizedTests: null,
+            patientSummary: null,
+            finalOutput: null,
+            errorReason: null,
+            confidence: null,
+            processingTimeMs: null,
+          });
+
+          // Process the individual report
+          const processingResult = await medicalProcessor.processComplete(report);
+          const processingTime = Date.now() - startTime;
+
+          if (processingResult.status === "ok") {
+            // Update with successful result
+            await storage.updateMedicalReport(dbReport.id, {
+              status: "completed",
+              finalOutput: processingResult,
+              confidence: processingResult.confidence,
+              processingTimeMs: processingTime,
+            });
+            
+            results.push(processingResult);
+            successful++;
+          } else {
+            // Update with error result
+            await storage.updateMedicalReport(dbReport.id, {
+              status: "unprocessed",
+              errorReason: processingResult.reason,
+              processingTimeMs: processingTime,
+            });
+            
+            results.push(processingResult);
+            failed++;
+          }
+        } catch (processingError) {
+          console.error(`Error processing report ${i + 1} in batch ${batchId}:`, processingError);
+          
+          const errorResult = {
+            status: "unprocessed" as const,
+            reason: `Processing error: ${processingError instanceof Error ? processingError.message : String(processingError)}`,
+            timestamp: new Date().toISOString()
+          };
+          
+          results.push(errorResult);
+          failed++;
+        }
+      }
+
+      const totalProcessingTime = Date.now() - startTime;
+      
+      // Determine overall batch status
+      let batchStatus: "completed" | "partial_failure" | "failed";
+      if (failed === 0) {
+        batchStatus = "completed";
+      } else if (successful > 0) {
+        batchStatus = "partial_failure";
+      } else {
+        batchStatus = "failed";
+      }
+
+      const batchResponse = {
+        batch_id: batchId,
+        total_reports: reports.length,
+        successful,
+        failed,
+        processing_time: `${(totalProcessingTime / 1000).toFixed(1)}s`,
+        results,
+        status: batchStatus
+      };
+
+      console.log(`Batch ${batchId} completed: ${successful} successful, ${failed} failed`);
+      res.json(batchResponse);
+      
+    } catch (error) {
+      console.error("Batch processing error:", error);
+      res.status(500).json({ 
+        status: "unprocessed",
+        reason: "Internal server error during batch processing",
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // Batch processing with file uploads
+  app.post("/api/v1/process/batch-files", upload.array('files', 10), async (req, res) => {
+    const startTime = Date.now();
+    
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: "No files uploaded" });
+      }
+
+      const files = req.files as Express.Multer.File[];
+      const batchId = `batch_files_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      console.log(`Processing file batch ${batchId} with ${files.length} files`);
+
+      const results = [];
+      let successful = 0;
+      let failed = 0;
+
+      // Process each file in the batch
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        console.log(`Processing file ${i + 1}/${files.length} in batch ${batchId}: ${file.originalname}`);
+        
+        try {
+          const base64Data = file.buffer.toString('base64');
+          const request = { input_type: 'image' as const, data: base64Data };
+          
+          // Create individual medical report record
+          const dbReport = await storage.createMedicalReport({
+            inputType: 'image',
+            originalInput: base64Data,
+            status: "processing",
+            ocrResults: null,
+            normalizedTests: null,
+            patientSummary: null,
+            finalOutput: null,
+            errorReason: null,
+            confidence: null,
+            processingTimeMs: null,
+          });
+
+          // Process the individual file
+          const processingResult = await medicalProcessor.processComplete(request);
+          const processingTime = Date.now() - startTime;
+
+          if (processingResult.status === "ok") {
+            // Update with successful result
+            await storage.updateMedicalReport(dbReport.id, {
+              status: "completed",
+              finalOutput: processingResult,
+              confidence: processingResult.confidence,
+              processingTimeMs: processingTime,
+            });
+            
+            results.push(processingResult);
+            successful++;
+          } else {
+            // Update with error result
+            await storage.updateMedicalReport(dbReport.id, {
+              status: "unprocessed",
+              errorReason: processingResult.reason,
+              processingTimeMs: processingTime,
+            });
+            
+            results.push(processingResult);
+            failed++;
+          }
+        } catch (processingError) {
+          console.error(`Error processing file ${i + 1} in batch ${batchId}:`, processingError);
+          
+          const errorResult = {
+            status: "unprocessed" as const,
+            reason: `File processing error: ${processingError instanceof Error ? processingError.message : String(processingError)}`,
+            timestamp: new Date().toISOString()
+          };
+          
+          results.push(errorResult);
+          failed++;
+        }
+      }
+
+      const totalProcessingTime = Date.now() - startTime;
+      
+      // Determine overall batch status
+      let batchStatus: "completed" | "partial_failure" | "failed";
+      if (failed === 0) {
+        batchStatus = "completed";
+      } else if (successful > 0) {
+        batchStatus = "partial_failure";
+      } else {
+        batchStatus = "failed";
+      }
+
+      const batchResponse = {
+        batch_id: batchId,
+        total_reports: files.length,
+        successful,
+        failed,
+        processing_time: `${(totalProcessingTime / 1000).toFixed(1)}s`,
+        results,
+        status: batchStatus
+      };
+
+      console.log(`File batch ${batchId} completed: ${successful} successful, ${failed} failed`);
+      res.json(batchResponse);
+      
+    } catch (error) {
+      console.error("Batch file processing error:", error);
+      res.status(500).json({ 
+        status: "unprocessed",
+        reason: "Internal server error during batch file processing",
+        timestamp: new Date().toISOString()
+      });
     }
   });
 

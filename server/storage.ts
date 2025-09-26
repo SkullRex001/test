@@ -1,5 +1,7 @@
-import { type User, type InsertUser, type MedicalReport, type InsertMedicalReport } from "@shared/schema";
+import { type User, type InsertUser, type MedicalReport, type InsertMedicalReport, users, medicalReports } from "@shared/schema";
 import { randomUUID } from "crypto";
+import { eq, desc } from "drizzle-orm";
+import { db } from "./db";
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
@@ -96,4 +98,68 @@ export class MemStorage implements IStorage {
   }
 }
 
-export const storage = new MemStorage();
+export class PostgresStorage implements IStorage {
+  async getUser(id: string): Promise<User | undefined> {
+    const result = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    return result[0];
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const result = await db.select().from(users).where(eq(users.username, username)).limit(1);
+    return result[0];
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const result = await db.insert(users).values(insertUser).returning();
+    return result[0];
+  }
+
+  async getMedicalReport(id: string): Promise<MedicalReport | undefined> {
+    const result = await db.select().from(medicalReports).where(eq(medicalReports.id, id)).limit(1);
+    return result[0];
+  }
+
+  async createMedicalReport(insertReport: InsertMedicalReport): Promise<MedicalReport> {
+    const result = await db.insert(medicalReports).values({
+      inputType: insertReport.inputType,
+      originalInput: insertReport.originalInput,
+      ocrResults: insertReport.ocrResults,
+      normalizedTests: insertReport.normalizedTests,
+      patientSummary: insertReport.patientSummary,
+      finalOutput: insertReport.finalOutput,
+      status: insertReport.status || "processing",
+      errorReason: insertReport.errorReason,
+      confidence: insertReport.confidence,
+      processingTimeMs: insertReport.processingTimeMs,
+    }).returning();
+    return result[0];
+  }
+
+  async updateMedicalReport(id: string, updates: Partial<MedicalReport>): Promise<MedicalReport | undefined> {
+    const result = await db.update(medicalReports)
+      .set({
+        ...updates,
+        updatedAt: new Date(),
+      })
+      .where(eq(medicalReports.id, id))
+      .returning();
+    return result[0];
+  }
+
+  async getMedicalReports(limit = 50, offset = 0): Promise<MedicalReport[]> {
+    return await db.select()
+      .from(medicalReports)
+      .orderBy(desc(medicalReports.createdAt))
+      .limit(limit)
+      .offset(offset);
+  }
+
+  async getMedicalReportsByStatus(status: string): Promise<MedicalReport[]> {
+    return await db.select()
+      .from(medicalReports)
+      .where(eq(medicalReports.status, status))
+      .orderBy(desc(medicalReports.createdAt));
+  }
+}
+
+export const storage = new PostgresStorage();

@@ -75,6 +75,21 @@ export const processRequestSchema = z.object({
   data: z.string(), // text content or base64 image
 });
 
+export const batchProcessRequestSchema = z.object({
+  reports: z.array(processRequestSchema).min(1).max(10), // Allow 1-10 reports per batch
+  batch_id: z.string().optional(), // Optional batch identifier
+});
+
+export const batchProcessResponseSchema = z.object({
+  batch_id: z.string(),
+  total_reports: z.number(),
+  successful: z.number(),
+  failed: z.number(),
+  processing_time: z.string(),
+  results: z.array(z.union([finalOutputSchema, errorOutputSchema])),
+  status: z.enum(["completed", "partial_failure", "failed"]),
+});
+
 export const insertUserSchema = createInsertSchema(users).pick({
   username: true,
   password: true,
